@@ -1,0 +1,65 @@
+# Job image for the virtual CI of Flutter repositories, run by GitHub Actions as a `container:`.
+#
+# Same sandbox layout as the php image (Dockerfile): no USER directive because Actions needs
+# root to mount its workspace, and the scripts under /opt/ci drop to the unprivileged `ci`
+# account (uid 2000) with setpriv before they touch anything that came from a pull request.
+# php-cli is here only for the root-side summariser inside ci-job; the Flutter suites never
+# run PHP.
+#
+# trixie, not bookworm: icon checks (uptizm bin/sync-icons --check) compare librsvg renders with
+# committed PNGs, and bookworm's librsvg 2.54 draws feDropShadow differently enough to move up to
+# 9% of the pixels; trixie's 2.60 matches what the repositories commit.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+
+# git, curl, unzip and xz-utils are what the Flutter tool and actions/checkout need; util-linux
+# brings setpriv and procps brings pkill, both used by the sandbox scripts. librsvg2-bin and
+# python3-pil are the icon renderer and comparer. No sudo: nothing in a job may regain root.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        librsvg2-bin \
+        php-cli \
+        procps \
+        python3 \
+        python3-pil \
+        unzip \
+        util-linux \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Latest 3.47.x stable from the official releases manifest; bump the version and the checksum
+# together. The checksum is the one published for the linux tarball.
+ARG FLUTTER_VERSION=3.47.9
+ARG FLUTTER_SHA256=25ed8c3c29d51a7353f2a944310b478af8214920639524b19c50a19e6c044c5a
+RUN curl -fsSLo /tmp/flutter.tar.xz \
+        "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" \
+    && echo "${FLUTTER_SHA256}  /tmp/flutter.tar.xz" | sha256sum -c - \
+    && tar -C /opt --no-same-owner -xJf /tmp/flutter.tar.xz \
+    && rm /tmp/flutter.tar.xz
+
+# A fresh HOME is created per run by ci-sandbox; the account exists so setpriv has a stable uid
+# to drop to.
+RUN useradd -u 2000 -m -s /bin/bash ci
+
+# The SDK stays root-owned, readable but unwritable by `ci`: a file planted in /opt/flutter/bin
+# would be resolved by anything that has it on PATH. Only what the Flutter tool writes at run time
+# belongs to `ci`: bin/cache (its lockfile and stamps) and packages/flutter_tools/.dart_tool (pub
+# rewrites its package_config.json on every `flutter pub get`; probe.yml found it). The tool
+# snapshot, the version file and the artifacts are made here at build time, so a job neither
+# rebuilds the tool nor downloads an engine. The safe.directory entry lets `ci` run git in the
+# root-owned SDK checkout, which the tool does to learn its own revision.
+RUN git config --system --add safe.directory /opt/flutter \
+    && /opt/flutter/bin/flutter config --no-analytics \
+    && /opt/flutter/bin/flutter --version \
+    && /opt/flutter/bin/flutter precache --no-android --no-ios \
+    && chmod -R go-w,a+rX /opt/flutter \
+    && chown -R ci:ci /opt/flutter/bin/cache /opt/flutter/packages/flutter_tools/.dart_tool
+
+# Explicit glob, not the whole directory: scripts/test holds the harness tests and must not ship.
+# COPY writes root-owned files, so a job running as `ci` cannot rewrite the code that sandboxes it.
+COPY --chmod=0755 scripts/ci-* /opt/ci/
+
+# /opt/flutter/bin is not here: ci-sandbox puts it on the PATH of the sandboxed child only.
+ENV PATH=/opt/ci:${PATH}

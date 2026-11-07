@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Isolation probe: runs inside ci-sandbox as uid 2000 and tries every way out
+# the sandbox is meant to close. Each attempt is recorded in <report-file> as
+# `<check>=blocked` or `<check>=LEAKED`; the root step of probe.yml fails the
+# job on any LEAKED line or a missing check. A value the probe manages to read
+# is never printed or recorded, only the fact that the read worked.
+#
+# usage: ci-probe <report-file>
+#        ci-probe --postgres <report-file>
+#        ci-probe --flutter <report-file>
+#
+# --flutter runs in the flutter image and records whether uid 2000 can write
+# /opt/flutter or /opt/flutter/bin (flutter_sdk_write) or any directory on
+# root's PATH (root_path_write); both must be blocked.
+#
+# --postgres runs under `ci-sandbox --keep --postgres`, so initdb and pg_ctl
+# have already run as uid 2000. It records whether `select 1` answers
+# (postgres_select=ok) and whether the server started a detached program the
+# way `COPY ... TO PROGRAM` does (copy_program=ok); probe.yml then expects that
+# program alive before `ci-sandbox --reap` and gone after it.
+#
+# Environment (paths only, set by probe.yml through ci-sandbox):
+#   CI_PROBE_FILE     root-only file holding the probe secret
+#   CI_PROBE_TEMP     the runner's temp directory
+#   CI_PROBE_SUMMARY  the step's GITHUB_STEP_SUMMARY file
+#   CI_PROBE_ENV, CI_PROBE_OUTPUT, CI_PROBE_PATH  the step's file command files
+#
+# The secret has the shape ciprobe-<32 hex>; the probe searches for that
+# shape because it is never told the value.
+set -euo pipefail
+
+probe_mode=sandbox
+case "${1:-}" in
+    --postgres | --flutter)
+        probe_mode="${1#--}"
+        shift
+        ;;
+esac
+
+report="${1:?usage: ci-probe [--postgres | --flutter] <report-file>}"
+secret_pattern='ciprobe-[0-9a-f]{32}'
+self_uid="$(id -u)"
+
+record() {
+    printf '%s=%s\n' "$1" "$2" >>"$report"
+}
+
+verdict() {
+    if [ "$2" = true ]; then
+        record "$1" LEAKED
+    else
+        record "$1" blocked
+    fi
+}
+
+# The program's command line carries a marker probe.yml looks for with pgrep;
+# setsid -f detaches it, so COPY returns while it keeps running.
+probe_postgres() {
+    local program='setsid -f bash -c "while :; do sleep 5; done # ciprobe-copy-program" </dev/null >/dev/null 2>&1'
+
+    if [ "$(psql -X -qAt -c 'select 1')" = 1 ]; then
+        record postgres_select ok
+    else
+        record postgres_select failed
+    fi
+
+    if psql -X -q -v ON_ERROR_STOP=1 -c "COPY (SELECT 1) TO PROGRAM '$program'"; then
+        record copy_program ok
+    else
+        record copy_program failed
+    fi
+}
+
+# Root resolves its commands from these directories, and the sandboxed child
+# resolves flutter and dart from /opt/flutter/bin. A file planted in any of
+# them would run as whoever finds it first, so none may take a write.
+probe_flutter() {
+    local dir
+    local sdk_write=false
+    local root_path_write=false
+
+    for dir in /opt/flutter /opt/flutter/bin; do
+        if { : >"$dir/ciprobe-planted"; } 2>/dev/null; then
+            sdk_write=true
+        fi
+    done
+    if { : >>/opt/flutter/bin/flutter; } 2>/dev/null; then
+        sdk_write=true
+    fi
+    verdict flutter_sdk_write "$sdk_write"
+
+    for dir in /opt/ci /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        if { : >"$dir/ciprobe-planted"; } 2>/dev/null; then
+            root_path_write=true
+        fi
+    done
+    verdict root_path_write "$root_path_write"
+}
+
+: >"$report"
+
+case "$probe_mode" in
+    postgres)
+        probe_postgres
+        exit 0
+        ;;
+    flutter)
+        probe_flutter
+        exit 0
+        ;;
+esac
+
+# 1. Process environments: the secret, the OIDC request token, and any other
+#    account's environ at all (the kernel gates it behind ptrace access).
+environ_secret=false
+environ_oidc=false
+environ_foreign=false
+cmdline_secret=false
+foreign_fd_write=false
+cmdline_readable=no
+
+for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    owner="$(stat -c %u "$proc" 2>/dev/null)" || continue
+
+    if grep -qaE "$secret_pattern" "$proc/environ" 2>/dev/null; then
+        environ_secret=true
+    fi
+    if grep -qa 'ACTIONS_ID_TOKEN_REQUEST_TOKEN=' "$proc/environ" 2>/dev/null; then
+        environ_oidc=true
+    fi
+    if grep -qaE "$secret_pattern" "$proc/cmdline" 2>/dev/null; then
+        cmdline_secret=true
+    fi
+
+    if [ "$owner" != "$self_uid" ] && [ "$pid" != "$$" ]; then
+        if head -c 1 "$proc/environ" >/dev/null 2>&1; then
+            environ_foreign=true
+        fi
+        if head -c 1 "$proc/cmdline" >/dev/null 2>&1; then
+            cmdline_readable=yes
+        fi
+        # A root process's stdout may be the step's pipe to the runner.
+        if { printf '::error::CIPROBE-MARKER via /proc/%s/fd/1\n' "$pid" >>"$proc/fd/1"; } 2>/dev/null; then
+            foreign_fd_write=true
+        fi
+    fi
+done
+
+verdict environ_secret "$environ_secret"
+verdict environ_oidc "$environ_oidc"
+verdict environ_foreign "$environ_foreign"
+verdict cmdline_secret "$cmdline_secret"
+verdict foreign_fd_write "$foreign_fd_write"
+# Informational: whether argv of other accounts is readable (no hidepid).
+record info_cmdline_readable "$cmdline_readable"
+
+# 2. The root-only secret file and the runner's temp directory.
+file_read=false
+if [ -n "${CI_PROBE_FILE:-}" ] && head -c 1 "$CI_PROBE_FILE" >/dev/null 2>&1; then
+    file_read=true
+fi
+verdict file_read "$file_read"
+
+temp_read=false
+if [ -n "${CI_PROBE_TEMP:-}" ] && ls "$CI_PROBE_TEMP" >/dev/null 2>&1; then
+    temp_read=true
+fi
+verdict temp_read "$temp_read"
+
+# 3. The step summary and the file command files, by path and by directory.
+summary_write=false
+if [ -n "${CI_PROBE_SUMMARY:-}" ] \
+    && { printf '::error::CIPROBE-MARKER in the step summary\n' >>"$CI_PROBE_SUMMARY"; } 2>/dev/null; then
+    summary_write=true
+fi
+verdict summary_write "$summary_write"
+
+file_commands_write=false
+for command_file in "${CI_PROBE_ENV:-}" "${CI_PROBE_OUTPUT:-}" "${CI_PROBE_PATH:-}"; do
+    if [ -z "$command_file" ]; then
+        continue
+    fi
+    if { printf 'CIPROBE_MARKER=1\n' >>"$command_file"; } 2>/dev/null; then
+        file_commands_write=true
+    fi
+    if { : >"$(dirname "$command_file")/ciprobe-planted"; } 2>/dev/null; then
+        file_commands_write=true
+    fi
+done
+verdict file_commands_write "$file_commands_write"
+
+# 4. Inherited descriptors and the terminal: anything open besides 0, 1 and 2
+#    could lead back to the runner's parser. 255 is bash's own handle on this
+#    script. The descriptor the glob itself opened is closed again by the time
+#    the loop runs, and `[ -e ]` opens none, so it cannot report its own.
+open_fd=false
+for fd_path in /proc/"$$"/fd/*; do
+    case "${fd_path##*/}" in
+        0 | 1 | 2 | 255)
+            continue
+            ;;
+    esac
+    if [ -e "$fd_path" ]; then
+        open_fd=true
+    fi
+done
+verdict open_fd "$open_fd"
+
+tty_write=false
+if { printf '::error::CIPROBE-MARKER via /dev/tty\n' >/dev/tty; } 2>/dev/null; then
+    tty_write=true
+fi
+verdict tty_write "$tty_write"
+
+# 5. Privileges: the uid, no groups, no capabilities, no_new_privs set.
+privileges=false
+if [ "$self_uid" -ne 2000 ] || [ "$(id -g)" -ne 2000 ] || [ "$(id -G)" != 2000 ]; then
+    privileges=true
+fi
+if ! awk '$1 == "NoNewPrivs:" && $2 == 1 { found = 1 } END { exit !found }' /proc/self/status; then
+    privileges=true
+fi
+if awk '$1 ~ /^Cap(Inh|Prm|Eff|Bnd|Amb):$/ && $2 !~ /^0+$/ { found = 1 } END { exit !found }' /proc/self/status; then
+    privileges=true
+fi
+verdict privileges "$privileges"
+
+# 6. Workflow commands on the probe's own stdout and stderr. These go to the
+#    sandbox log; probe.yml's public log and annotations must not show them.
+printf '::error::CIPROBE-MARKER on stdout\n'
+printf '::error::CIPROBE-MARKER on stderr\n' >&2
+printf '::add-mask::CIPROBE-MASK\n'
+printf '::warning::CIPROBE-MARKER on stdout\n'
+
+# 7. A daemon in its own session, detached from the probe. ci-sandbox has to
+#    kill it; probe.yml's expect_fail run keeps it to prove the check bites.
+setsid -f bash -c 'while :; do sleep 5; done' </dev/null >/dev/null 2>&1
+record daemon started

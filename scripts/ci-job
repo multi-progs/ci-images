@@ -1,0 +1,1181 @@
+#!/usr/bin/env bash
+# One virtual CI job, in the two steps ci.yml calls:
+#
+# usage: ci-job prepare | run
+#
+# prepare  trades an OIDC token (aud CI_TOKEN_AUDIENCE) for the job's facts, the
+#          repository's manifest block for this job's stack and a short-lived
+#          installation token, fetches the private head and base commits with
+#          it, revokes it, resolves the manifest's directory, lets the
+#          repository's own scope script decide the scope (as uid 2000; in pr
+#          mode the base commit's copy of it), removes .git, and writes
+#          cache_key, cache_scope and mode to $GITHUB_OUTPUT (masked). ci.yml
+#          then restores the dependency cache into
+#          /ci/cache, before any pull request code has run.
+# run      installs dependencies and runs the role's manifest commands as uid
+#          2000 through ci-sandbox, kills every uid 2000 process, and only then
+#          fetches a fresh OIDC token (aud CI_RESULTS_AUDIENCE) to post the
+#          results. It posts on a failed command (status failed) and on an
+#          internal error (status errored) too.
+#
+# Environment: CI_RUN_ID (lowercase UUID), CI_JOB_NAME (`lint`, `test (2)`,
+# `flutter-test (1)`), CI_API (the server's base URL), CI_TOKEN_AUDIENCE and
+# CI_RESULTS_AUDIENCE (the two OIDC audiences), none with a default, and the
+# runner's ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
+#
+# The manifest and the cache namespace come from the token response only,
+# never from the checkout. Every manifest command runs as `bash -c` under
+# ci-sandbox in the manifest's directory with CI_REPORT_DIR (a uid 2000
+# directory for junit.xml, pint.json or flutter.json), CI_SHARD and
+# CI_SHARDS (test roles), CI_SCOPE_PHP and CI_SCOPE_FILTER (laravel with a
+# scope script) and CI_CHANGED_FILES (a file of repository-relative paths
+# changed since the scope's pint_base; unset when everything is checked).
+#
+# The public log gets fixed `ci:` lines only, never a manifest command, a
+# directory or a repository name. Every command's own output goes to
+# root-only logs under /ci/state, because an error message (git's, jq's) can
+# quote the private repository name or a token. No secret is ever an
+# argument: curl reads headers from 0600 config files, git reads the token
+# through GIT_ASKPASS.
+#
+# Exits 0 once the server accepted the results, whatever their status, so the
+# public run carries no verdict on private code; 1 when they were not
+# delivered or prepare failed.
+set -Eeuo pipefail
+
+root=/ci
+state="$root/state"
+secret="$root/secret"
+tree="$root/tree"
+out="$root/out"
+cache="$root/cache"
+changed_files="$root/changed-files"
+scope_file="$root/scope-script"
+sandbox_uid=2000
+api="${CI_API:-}"
+api="${api%/}"
+token_audience="${CI_TOKEN_AUDIENCE:-}"
+results_audience="${CI_RESULTS_AUDIENCE:-}"
+
+phase=''
+status=errored
+last_log=''
+reporting=false
+sandbox_env=()
+
+say() {
+    printf 'ci: %s\n' "$1" >&3
+}
+
+http_status() {
+    cat "$1.status" 2>/dev/null || echo 000
+}
+
+# usage: sandboxed [--postgres] <log-name> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+sandboxed() {
+    local flags=()
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
+    local name="$1"
+    local workdir="$2"
+    shift 2
+
+    last_log="$name"
+    ci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+}
+
+# Prints the real path of <dir> inside <tree>, or fails for an absolute path,
+# a `..` component, a symlink at any component, anything but a directory, and
+# whatever realpath places outside <tree>. The manifest names <dir> and the
+# checkout is pull request code, so both are untrusted.
+resolve_dir() {
+    local tree_root="$1"
+    local dir="$2"
+    local path
+    local component
+    local components=()
+    local resolved
+
+    if ! [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$dir" == /* ]]; then
+        return 1
+    fi
+
+    tree_root="$(realpath "$tree_root")" || return 1
+    path="$tree_root"
+
+    IFS=/ read -r -a components <<<"$dir"
+    for component in "${components[@]}"; do
+        case "$component" in
+            '' | .) continue ;;
+            ..) return 1 ;;
+        esac
+
+        path="$path/$component"
+        if [ -L "$path" ] || [ ! -d "$path" ]; then
+            return 1
+        fi
+    done
+
+    resolved="$(realpath "$path")" || return 1
+    if [ "$resolved" != "$tree_root" ] && [[ "$resolved" != "$tree_root"/* ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$resolved"
+}
+
+# Writes a curl config carrying a fresh OIDC token for <audience>. The runner's
+# request token goes to one 0600 config, the JWT it returns to another.
+oidc_config() {
+    local audience="$1"
+    local config="$2"
+    local request_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+    if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || ! [[ "$request_token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        say 'no OIDC request token; the job needs permission id-token: write'
+        return 1
+    fi
+
+    printf 'header = "Authorization: Bearer %s"\n' "$request_token" >"$secret/oidc-request.curl"
+
+    if ! ci-post "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" "$secret/oidc-request.curl" "$secret/oidc.json"; then
+        say "OIDC token request failed (HTTP $(http_status "$secret/oidc.json"))"
+        rm -f "$secret/oidc-request.curl" "$secret/oidc.json"
+        return 1
+    fi
+
+    jq -er '
+        .value
+        | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"))
+        | "header = \"Authorization: Bearer \(.)\"\nheader = \"Accept: application/json\""
+    ' "$secret/oidc.json" >"$config"
+
+    rm -f "$secret/oidc-request.curl" "$secret/oidc.json" "$secret/oidc.json.status"
+}
+
+revoke_token() {
+    local revoked=true
+
+    if [ ! -f "$secret/github.curl" ]; then
+        return 0
+    fi
+
+    if ! ci-post -X DELETE https://api.github.com/installation/token "$secret/github.curl" "$state/revoke.json"; then
+        revoked=false
+    fi
+
+    rm -f "$secret/github.curl" "$secret/github-token" "$secret/askpass" "$secret/token.json"
+
+    if [ "$revoked" = false ]; then
+        say "installation token revocation failed (HTTP $(http_status "$state/revoke.json"))"
+        return 1
+    fi
+}
+
+write_empty_summary() {
+    jq -n '{counts: {tests: 0, failures: 0, errors: 0, skipped: 0}, failures: [], annotations: []}' \
+        >"$state/summary.json"
+}
+
+# Turns a JUnit XML, Pint JSON or Flutter JSON reporter file into {counts,
+# failures, annotations}. The file came out of the sandbox, so it is parsed as
+# data only: no network, no entity expansion beyond libxml's defaults, invalid
+# UTF-8 substituted. The flutter image ships PHP 8.2, so nothing newer is used.
+summarise() {
+    php -d memory_limit=1G -- "$1" "$2" "$tree/" >"$state/summary.json" <<'PHP'
+<?php
+
+[, $kind, $file, $prefix] = $argv;
+
+$relative = static fn (string $path): string => str_starts_with($path, $prefix)
+    ? substr($path, strlen($prefix))
+    : $path;
+$clip = static fn (string $text): string => mb_substr($text, 0, 2000);
+
+$summary = [
+    'counts' => [
+        'tests' => 0,
+        'failures' => 0,
+        'errors' => 0,
+        'skipped' => 0,
+    ],
+    'failures' => [],
+    'annotations' => [],
+];
+
+// Failures only: the server turns every failure with a file and line into an
+// annotation, so sending annotations too would show each one twice.
+$fail = static function (string $path, int $line, string $name, string $message) use (&$summary, $clip): void {
+    $summary['failures'][] = [
+        'file' => $path,
+        'line' => $line,
+        'name' => $name,
+        'message' => $clip($message),
+    ];
+};
+
+if ($kind === 'junit') {
+    $xml = simplexml_load_file($file, null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+
+    if ($xml === false) {
+        exit(1);
+    }
+
+    foreach ($xml->xpath('//testcase') ?: [] as $case) {
+        $summary['counts']['tests']++;
+        $name = trim($case['class'].'::'.$case['name'], ':');
+        $path = $relative((string) $case['file']);
+        $line = (int) $case['line'];
+
+        if (isset($case->failure)) {
+            $summary['counts']['failures']++;
+            $fail($path, $line, $name, trim((string) $case->failure));
+        } elseif (isset($case->error)) {
+            $summary['counts']['errors']++;
+            $fail($path, $line, $name, trim((string) $case->error));
+        } elseif (isset($case->skipped)) {
+            $summary['counts']['skipped']++;
+        }
+    }
+}
+
+if ($kind === 'pint') {
+    $report = json_decode((string) file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
+
+    foreach ($report['files'] ?? [] as $entry) {
+        $fixers = implode(', ', array_map('strval', (array) ($entry['fixers'] ?? [])));
+        $summary['counts']['failures']++;
+        $fail($relative((string) ($entry['path'] ?? '')), 1, 'Pint', "Pint would fix: {$fixers}");
+    }
+}
+
+// One JSON event per line. A test is counted at its testDone; a hidden test
+// (the synthetic "loading <file>" one) counts only when it did not pass,
+// which is how a compile error shows up. The location prefers root_url and
+// root_line, the declaration inside the test file itself.
+if ($kind === 'flutter') {
+    $handle = fopen($file, 'rb');
+
+    if ($handle === false) {
+        exit(1);
+    }
+
+    $suites = [];
+    $tests = [];
+    $errors = [];
+    $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
+
+    while (($line = fgets($handle)) !== false) {
+        $event = json_decode($line, true, 64);
+
+        if (! is_array($event)) {
+            continue;
+        }
+
+        $type = $event['type'] ?? null;
+
+        if ($type === 'suite') {
+            $suites[(int) ($event['suite']['id'] ?? -1)] = (string) ($event['suite']['path'] ?? '');
+        } elseif ($type === 'testStart') {
+            $test = (array) ($event['test'] ?? []);
+            $url = $test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '';
+            $tests[(int) ($test['id'] ?? -1)] = [
+                'file' => $path($url),
+                'line' => (int) ($test['root_line'] ?? $test['line'] ?? 0),
+                'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
+            ];
+        } elseif ($type === 'error') {
+            $errors[(int) ($event['testID'] ?? -1)][] = trim(
+                ((string) ($event['error'] ?? ''))."\n".((string) ($event['stackTrace'] ?? '')),
+            );
+        } elseif ($type === 'testDone') {
+            $id = (int) ($event['testID'] ?? -1);
+            $result = (string) ($event['result'] ?? 'success');
+
+            if (($event['hidden'] ?? false) === true && $result === 'success') {
+                continue;
+            }
+
+            $summary['counts']['tests']++;
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => ''];
+            $message = implode("\n\n", $errors[$id] ?? []);
+
+            if (($event['skipped'] ?? false) === true) {
+                $summary['counts']['skipped']++;
+            } elseif ($result === 'failure') {
+                $summary['counts']['failures']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            } elseif ($result === 'error') {
+                $summary['counts']['errors']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            }
+        }
+    }
+
+    fclose($handle);
+}
+
+echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+PHP
+}
+
+# Copies a result file out of $out as uid 2000, so a symlink planted in its
+# place resolves with the sandbox's rights rather than root's.
+collect() {
+    local kind="$1"
+    local name="$2"
+    local copy="$state/result.$kind"
+
+    write_empty_summary
+    rm -f "$copy"
+
+    if ! ci-sandbox "$copy" "$out" -- head -c 67108864 "$name"; then
+        return 0
+    fi
+
+    if ! summarise "$kind" "$copy"; then
+        write_empty_summary
+    fi
+}
+
+# Summarises the first report a command left in CI_REPORT_DIR. The existence
+# test only stats the name; collect does the reading.
+collect_report() {
+    local report
+    local kind
+    local name
+
+    for report in junit:junit.xml pint:pint.json flutter:flutter.json; do
+        kind="${report%%:*}"
+        name="${report#*:}"
+
+        if [ -e "$out/$name" ] || [ -L "$out/$name" ]; then
+            collect "$kind" "$name"
+            return 0
+        fi
+    done
+}
+
+# Fits the payload into 512 KB: the full caps first (200 failures, 2000
+# characters each, 500 annotations), then tighter ones, then counts only.
+build_payload() {
+    local tier
+    local max_failures
+    local max_message
+    local max_annotations
+    local tail_file="$state/tail.txt"
+
+    : >"$tail_file"
+    if [ -n "$last_log" ] && [ -f "$state/$last_log.log" ]; then
+        tail -c 2000 "$state/$last_log.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' >"$tail_file"
+    fi
+
+    for tier in '200 2000 500' '50 500 100' '0 0 0'; do
+        read -r max_failures max_message max_annotations <<<"$tier"
+
+        jq -n \
+            --arg id "$CI_RUN_ID" \
+            --arg status "$status" \
+            --argjson duration "$SECONDS" \
+            --arg phase "$last_log" \
+            --rawfile tail "$tail_file" \
+            --slurpfile summary "$state/summary.json" \
+            --argjson max_failures "$max_failures" \
+            --argjson max_message "$max_message" \
+            --argjson max_annotations "$max_annotations" '
+            $summary[0] as $s
+            | (
+                if ($s.failures | length) == 0 and ($status == "failed" or $status == "errored") and ($tail | length) > 0
+                then [{file: "", line: 0, name: $phase, message: $tail}]
+                else $s.failures
+                end
+            ) as $failures
+            | {
+                ci_run_id: $id,
+                status: $status,
+                duration_s: $duration,
+                counts: $s.counts,
+                failures: ($failures[:$max_failures] | map(.message |= .[:$max_message])),
+                annotations: ($s.annotations[:$max_annotations] | map(.message |= .[:$max_message])),
+            }
+        ' >"$state/results.json"
+
+        if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
+            return 0
+        fi
+    done
+
+    say 'results do not fit in 512 KB'
+    return 1
+}
+
+report() {
+    reporting=true
+
+    if [ ! -f "$state/summary.json" ]; then
+        write_empty_summary
+    fi
+
+    # 1. Nothing from the pull request may be alive once a secret is in use.
+    if ! ci-sandbox --reap; then
+        say 'uid 2000 processes survived; results not sent'
+        exit 1
+    fi
+
+    # 2. Only now mint the results token.
+    build_payload
+    oidc_config "$results_audience" "$secret/results.curl"
+
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+}
+
+on_error() {
+    trap - ERR
+
+    # errtrace hands this trap to command substitutions too; only the main
+    # shell reports, or one failure would post twice.
+    if [ "$BASHPID" != "$$" ]; then
+        exit 1
+    fi
+
+    say "internal error at line $1"
+
+    if [ "$reporting" = true ]; then
+        exit 1
+    fi
+
+    if [ -f "$secret/github.curl" ]; then
+        revoke_token
+    fi
+
+    status=errored
+    report
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# prepare
+# ---------------------------------------------------------------------------
+
+exchange_token() {
+    local repository
+
+    oidc_config "$token_audience" "$secret/oidc-token.curl"
+    jq -n --arg id "$CI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+
+    if ! ci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
+        rm -f "$secret/oidc-token.curl"
+        say "token exchange failed (HTTP $(http_status "$secret/token.json"))"
+        return 1
+    fi
+    rm -f "$secret/oidc-token.curl"
+
+    # Every value below lands in a path, a URL, a curl config or a sandboxed
+    # shell, so its shape is checked before use. The token allows dots and
+    # dashes: GitHub's stateless installation tokens carry a JWT after the
+    # ghs_ prefix. The manifest is the repository's own file, relayed by
+    # the server, so it is checked here too. Only the names of failing fields
+    # reach the public log, never a value.
+    local bad
+    bad="$(jq -r '
+        def relative_path:
+            type == "string"
+            and test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+            and (split("/") | all(. != "." and . != ".."));
+        def shell_text: type == "string" and length > 0 and all(explode[]; . != 0);
+        def commands: type == "array" and all(.[]; shell_text);
+        def optional(check): . == null or check;
+        def laravel_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.aux | optional(commands))
+            and (.services | optional(type == "array" and all(.[]; . == "postgres")))
+            and (.scope_script | optional(relative_path))
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.filter_script | optional(relative_path));
+        def flutter_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.command | optional(shell_text));
+        . as $r
+        | [
+            (if (.token | type == "string" and test("^[A-Za-z0-9._-]+$")) then empty else "token" end),
+            (if (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) then empty else "repository" end),
+            (if (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) then empty else "head_sha" end),
+            (if (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$"))) then empty else "base_sha" end),
+            (if (.mode | IN("pr", "main")) then empty else "mode" end),
+            (if (.role | IN("lint", "aux", "warm", "test", "flutter-lint", "flutter-warm", "flutter-test")) then empty else "role" end),
+            (if (.shards | type == "number" and . >= 1 and . == floor) then empty else "shards" end),
+            (if (.shard | type == "number" and . >= 1 and . == floor and . <= ($r.shards // 0)) then empty else "shard" end),
+            (if (.stack | IN("laravel", "flutter")) and ((.role | tostring | startswith("flutter-")) == (.stack == "flutter"))
+                then empty else "stack" end),
+            (if (.cache_namespace | type == "string" and test("^[0-9a-f]{16}$")) then empty else "cache_namespace" end),
+            (if (try (
+                (.manifest | type == "object")
+                and .manifest.version == 1
+                and (.manifest.stacks | type == "object")
+                and (.manifest.stacks | keys) == [$r.stack]
+                and (.manifest.stacks[$r.stack] | if $r.stack == "laravel" then laravel_block else flutter_block end)
+            ) catch false) then empty else "manifest" end)
+        ] | join(",")
+    ' "$secret/token.json")"
+
+    if [ -n "$bad" ]; then
+        say "the token response has an unexpected shape ($bad)"
+        return 1
+    fi
+
+    jq -j '.token' "$secret/token.json" >"$secret/github-token"
+    jq -r '
+        "header = \"Authorization: Bearer \(.token)\"",
+        "header = \"Accept: application/vnd.github+json\"",
+        "header = \"X-GitHub-Api-Version: 2022-11-28\""
+    ' "$secret/token.json" >"$secret/github.curl"
+
+    # The stack's manifest block is all run needs of the manifest; it stays
+    # root-only beside the logs.
+    jq '.manifest.stacks[.stack]' "$secret/token.json" >"$state/stack.json"
+
+    mode="$(jq -r '.mode' "$secret/token.json")"
+    role="$(jq -r '.role' "$secret/token.json")"
+    stack="$(jq -r '.stack' "$secret/token.json")"
+    shard="$(jq -r '.shard' "$secret/token.json")"
+    shards="$(jq -r '.shards' "$secret/token.json")"
+    head_sha="$(jq -r '.head_sha' "$secret/token.json")"
+    base_sha="$(jq -r '.base_sha // ""' "$secret/token.json")"
+    cache_namespace="$(jq -r '.cache_namespace' "$secret/token.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
+    repository="$(jq -r '.repository' "$secret/token.json")"
+
+    # The server resolves the job from its check_run_id; a role or shard that
+    # disagrees with this job's name means the two sides are out of step.
+    if [ "$role" != "${CI_JOB_NAME%% (*}" ]; then
+        say 'the token response names another role than this job'
+        return 1
+    fi
+    if [[ "$CI_JOB_NAME" =~ \(([0-9]+)\)$ ]] && [ "${BASH_REMATCH[1]}" != "$shard" ]; then
+        say 'the token response names another shard than this job'
+        return 1
+    fi
+
+    # The URL is written by printf, a builtin, so the repository name never
+    # becomes an argument of a git command.
+    git init --quiet "$tree"
+    printf '[remote "origin"]\n\turl = https://github.com/%s.git\n' "$repository" >>"$tree/.git/config"
+}
+
+# git asks GIT_ASKPASS for the password; the helper reads the token from the
+# 0600 file named in its environment, and credential.helper is emptied so no
+# helper stores it.
+git_with_token() {
+    GIT_ASKPASS="$secret/askpass" \
+        CI_GIT_TOKEN_FILE="$secret/github-token" \
+        GIT_TERMINAL_PROMPT=0 \
+        git -C "$tree" -c credential.helper= "$@"
+}
+
+fetch_source() {
+    cat >"$secret/askpass" <<'SH'
+#!/bin/sh
+case "$1" in
+    Username*) echo x-access-token ;;
+    *) cat "$CI_GIT_TOKEN_FILE" ;;
+esac
+SH
+    chmod 0700 "$secret/askpass"
+
+    if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$head_sha"; then
+        say 'fetching the head commit failed'
+        return 1
+    fi
+    git -C "$tree" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+
+    # The scope script diffs two trees, so it needs the base too; without one
+    # it runs everything, the same as ci.yml.
+    if [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$base_sha" =~ ^0+$ ]] && [ "$base_sha" != "$head_sha" ]; then
+        if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$base_sha"; then
+            base_sha=''
+        fi
+    fi
+}
+
+scope_value() {
+    awk -v key="$1=" 'index($0, key) == 1 { value = substr($0, length(key) + 1) } END { print value }' \
+        "$state/scope.log"
+}
+
+# In pr mode the head commit is the pull request's own code, so its scope
+# script could skip every test. Root copies the base commit's version to a
+# root-owned file uid 2000 can read, while root still owns .git (git refuses a
+# repository another account owns) and before any repository code has run.
+# Stages nothing in main mode, without a fetched base, or when the base has
+# no such script; decide_scope then runs everything.
+stage_scope_script() {
+    local scope_script
+
+    rm -f "$scope_file"
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$mode" != pr ] || [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$base_sha" =~ ^0+$ ]]; then
+        return 0
+    fi
+
+    if ! git -C "$tree" cat-file blob "$base_sha:$scope_script" >"$scope_file"; then
+        rm -f "$scope_file"
+        return 0
+    fi
+    chmod 0644 "$scope_file"
+}
+
+# Without a scope script everything runs: php full, aux on, every file linted.
+# The script path is relative to the repository root, not to the manifest's
+# directory, the same place a repository's own scope script has always run from. Main
+# mode runs the head's script (the default branch is trusted); pr mode runs
+# the copy stage_scope_script made, against the head tree.
+decide_scope() {
+    local scope_script
+    local scope_command
+
+    scoped=false
+    gateway=true
+    php=full
+    filter=''
+    pint_base=''
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    scoped=true
+
+    if [ "$mode" = main ]; then
+        scope_command=(bash "./$scope_script")
+    elif [ -f "$scope_file" ]; then
+        scope_command=(bash "$scope_file")
+    else
+        say 'no scope script on the base commit; everything runs'
+        return 0
+    fi
+
+    if ! sandboxed scope "$tree" -- "${scope_command[@]}" "$base_sha" "$head_sha" "$mode"; then
+        say 'the scope script failed'
+        return 1
+    fi
+
+    gateway="$(scope_value gateway)"
+    php="$(scope_value php)"
+    filter="$(scope_value filter)"
+    pint_base="$(scope_value pint_base)"
+
+    # The script reads the head tree (pull request code), so its answer is
+    # untrusted.
+    if ! [[ "$gateway" =~ ^(true|false)$ ]] \
+        || ! [[ "$php" =~ ^(none|docs|affected|full)$ ]] \
+        || ! [[ "$filter" =~ ^[A-Za-z0-9_|]*$ ]] \
+        || ! [[ "$pint_base" =~ ^([0-9a-f]{40})?$ ]]; then
+        say 'the scope script gave an unusable answer'
+        return 1
+    fi
+
+    if [ -z "$pint_base" ]; then
+        return 0
+    fi
+
+    # Files added, copied, modified or renamed since pint_base; the manifest's
+    # lint commands pick their own languages and exclusions from the list. Its
+    # log is the list, so git's stderr stays out of it.
+    if ! sandboxed changed-files "$tree" -- \
+        sh -c "exec git -c core.quotePath=false diff --name-only --diff-filter=ACMR \"\$1\" HEAD 2>/dev/null" \
+        ci-diff "$pint_base"; then
+        say 'listing the changed files failed'
+        return 1
+    fi
+}
+
+# Lock file contents under the manifest's directory: ci.yml restores the cache
+# under `ci-<namespace>-<stack>-<hash>` and falls back to the newest entry of
+# the same namespace and stack, so one repository never restores another's.
+cache_key() {
+    local workdir="$1"
+    local lock_files=(
+        composer.lock
+        package-lock.json
+    )
+    local file
+    local hash
+
+    if [ "$stack" = flutter ]; then
+        lock_files=(
+            pubspec.lock
+        )
+    fi
+
+    hash="$(
+        for file in "${lock_files[@]}"; do
+            if [ -f "$workdir/$file" ] && [ ! -L "$workdir/$file" ]; then
+                cat "$workdir/$file"
+            fi
+        done | sha256sum | cut -d' ' -f1
+    )"
+
+    printf '%s-%s-%s\n' "$cache_namespace" "$stack" "$hash"
+}
+
+prepare() {
+    local workdir
+    local key
+
+    say 'prepare'
+
+    # 1. Nothing may be running as uid 2000 while the tokens exist.
+    ci-sandbox --reap
+
+    # 2. Facts, manifest and token, then the source, then the token is gone.
+    exchange_token
+    fetch_source
+    revoke_token
+    say "mode=$mode"
+
+    # 3. Root resolves the manifest's directory, hashes the lock files and
+    #    stages the base commit's scope script before any repository code has
+    #    run.
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        return 1
+    fi
+    key="$(cache_key "$workdir")"
+    stage_scope_script
+
+    # 4. The repository's own scope rules run as uid 2000, after revocation.
+    #    -h: a symlink in the checkout is re-owned itself, never its target.
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$tree"
+    decide_scope
+    rm -rf "$tree/.git"
+
+    jq -n \
+        --arg mode "$mode" \
+        --arg role "$role" \
+        --arg stack "$stack" \
+        --argjson shard "$shard" \
+        --argjson shards "$shards" \
+        --argjson scoped "$scoped" \
+        --arg gateway "$gateway" \
+        --arg php "$php" \
+        --arg filter "$filter" \
+        --arg pint_base "$pint_base" \
+        '{
+            mode: $mode,
+            role: $role,
+            stack: $stack,
+            shard: $shard,
+            shards: $shards,
+            scoped: $scoped,
+            gateway: $gateway,
+            php: $php,
+            filter: $filter,
+            pint_base: $pint_base,
+        }' \
+        >"$state/job.json"
+
+    # 5. actions/cache needs the namespace for the key, and logs the key it
+    #    restores; masked first, so the public log shows *** in its place.
+    printf '::add-mask::%s\n' "$cache_namespace" "$key" >&3
+    printf 'cache_key=%s\ncache_scope=%s-%s\nmode=%s\n' "$key" "$cache_namespace" "$stack" "$mode" \
+        >>"${GITHUB_OUTPUT:?}"
+    say 'prepared'
+}
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+# usage: stack_sandboxed [--postgres] <log-name> [NAME=VALUE ...] -- <command> [arg ...]
+# Resolves the manifest's directory again before every call: the previous
+# command (uid 2000, reaped since, so nothing races this check) may have
+# swapped one of its components for a symlink.
+stack_sandboxed() {
+    local flags=()
+    local workdir
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        on_error "$LINENO"
+    fi
+
+    sandboxed "${flags[@]}" "$1" "$workdir" "${@:2}"
+}
+
+# usage: run_commands <phase> <manifest-key>
+# Runs the manifest's list under <manifest-key> one by one, each as `bash -c`
+# in the manifest's directory. Fails at the first that fails.
+run_commands() {
+    local phase="$1"
+    local key="$2"
+    local count
+    local index
+    local command
+
+    # Callers test this function, which switches errexit off in here; a jq
+    # failure must not read as an empty, passing list.
+    count="$(jq --arg key "$key" '.[$key] // [] | length' "$state/stack.json")" || on_error "$LINENO"
+
+    for ((index = 0; index < count; index++)); do
+        command="$(jq -r --arg key "$key" --argjson index "$index" '.[$key][$index]' "$state/stack.json")" \
+            || on_error "$LINENO"
+
+        if ! stack_sandboxed "$phase-$((index + 1))" -- bash -c "$command"; then
+            return 1
+        fi
+    done
+}
+
+composer_install() {
+    stack_sandboxed install BROADCAST_CONNECTION=log -- \
+        composer install --no-interaction --no-progress --prefer-dist "$@"
+}
+
+# Composer first (with the given flags), then the manifest's setup list.
+laravel_setup() {
+    say 'install'
+    if ! composer_install "$@"; then
+        return 1
+    fi
+
+    say 'setup'
+    run_commands setup setup
+}
+
+run_lint() {
+    if [ "$php" != affected ] && [ "$php" != full ]; then
+        status=skipped
+        return 0
+    fi
+
+    if ! laravel_setup --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    if run_commands lint lint; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_aux() {
+    if [ "$gateway" != true ]; then
+        status=skipped
+        return 0
+    fi
+
+    if ! laravel_setup --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'aux'
+    if run_commands aux aux; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if composer_install --no-scripts --no-plugins; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+run_test() {
+    local flags=()
+    local args=(
+        artisan
+        test
+    )
+
+    case "$php" in
+        none)
+            status=skipped
+            return 0
+            ;;
+        docs)
+            # ci.yml runs only the rule-file check here, once.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args+=(--compact --filter RuleFileClassReferencesTest)
+            ;;
+        affected)
+            # A filtered run is small, and split across shards most shards
+            # match nothing, which PHPUnit exits 1 on. Shard 1 runs it whole.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args=(artisan test --parallel --processes=4 --compact --filter "$filter")
+            ;;
+        full)
+            args=(artisan test --parallel --processes=4 --compact)
+            if [ "$shards" -gt 1 ]; then
+                args+=("--shard=$shard/$shards" --shard-test-distribution=sequential)
+            fi
+            ;;
+    esac
+    args+=(--log-junit "$out/junit.xml")
+
+    if jq -e '(.services // []) | index("postgres")' "$state/stack.json" >/dev/null; then
+        flags=(--postgres)
+    fi
+
+    if ! laravel_setup --optimize-autoloader; then
+        status=errored
+        return 0
+    fi
+
+    say 'test'
+    if stack_sandboxed "${flags[@]}" test -- php "${args[@]}"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_flutter_lint() {
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    if run_commands lint lint; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_flutter_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if stack_sandboxed install -- flutter pub get; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+run_flutter_test() {
+    local command
+
+    # The default expands inside the sandbox, from the CI_* environment.
+    command="$(jq -r '.test.command // empty' "$state/stack.json")"
+    if [ -z "$command" ]; then
+        command="$(
+            cat <<'SH'
+flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"
+SH
+        )"
+    fi
+
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'test'
+    if stack_sandboxed test -- bash -c "$command"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run() {
+    say 'run'
+
+    if [ ! -f "$state/job.json" ] || [ ! -f "$state/stack.json" ]; then
+        say 'prepare has not run in this container'
+        return 1
+    fi
+
+    mode="$(jq -r '.mode' "$state/job.json")"
+    role="$(jq -r '.role' "$state/job.json")"
+    stack="$(jq -r '.stack' "$state/job.json")"
+    shard="$(jq -r '.shard' "$state/job.json")"
+    shards="$(jq -r '.shards' "$state/job.json")"
+    scoped="$(jq -r '.scoped' "$state/job.json")"
+    gateway="$(jq -r '.gateway' "$state/job.json")"
+    php="$(jq -r '.php' "$state/job.json")"
+    filter="$(jq -r '.filter' "$state/job.json")"
+    pint_base="$(jq -r '.pint_base' "$state/job.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
+
+    # 1. The cache was restored by root; -h keeps a planted symlink from
+    #    handing uid 2000 the file it points at.
+    ci-sandbox --reap
+    install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$out"
+    install -d -m 0700 "$cache/composer" "$cache/npm" "$cache/pub"
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$cache"
+
+    # 2. The environment every manifest command sees (names fixed by the
+    #    manifest contract). The changed-file list is root's copy, read-only.
+    sandbox_env=(
+        CI_REPORT_DIR="$out"
+    )
+    if [ "$role" = test ] || [ "$role" = flutter-test ]; then
+        sandbox_env+=(
+            CI_SHARD="$shard"
+            CI_SHARDS="$shards"
+        )
+    fi
+    if [ "$scoped" = true ]; then
+        sandbox_env+=(
+            CI_SCOPE_PHP="$php"
+            CI_SCOPE_FILTER="$filter"
+        )
+    fi
+    if [ -n "$pint_base" ]; then
+        install -m 0644 "$state/changed-files.log" "$changed_files"
+        sandbox_env+=(
+            CI_CHANGED_FILES="$changed_files"
+        )
+    fi
+    if [ "$stack" = flutter ]; then
+        sandbox_env+=(
+            FLUTTER_SUPPRESS_ANALYTICS=true
+            PUB_CACHE="$cache/pub"
+        )
+    else
+        sandbox_env+=(
+            APP_ENV=testing
+            COMPOSER_CACHE_DIR="$cache/composer"
+            npm_config_cache="$cache/npm"
+        )
+    fi
+
+    # 3. The role's commands, whose outcome becomes the status.
+    write_empty_summary
+    case "$role" in
+        lint) run_lint ;;
+        aux) run_aux ;;
+        warm) run_warm ;;
+        test) run_test ;;
+        flutter-lint) run_flutter_lint ;;
+        flutter-warm) run_flutter_warm ;;
+        flutter-test) run_flutter_test ;;
+    esac
+
+    # 4. Kill, then report.
+    say 'report'
+    report
+}
+
+main() {
+    # Root resolves every command from root-owned directories only: the
+    # image's tool directories (the Flutter SDK among them) are uid 2000's
+    # PATH, never root's. Set here, not at file scope, so the test harness
+    # that sources this file keeps its own PATH.
+    export PATH=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    phase="${1:-}"
+
+    case "$phase" in
+        prepare | run) ;;
+        *)
+            echo 'usage: ci-job prepare | run' >&2
+            exit 2
+            ;;
+    esac
+
+    # The run id reaches a URL body and the token exchange, so it is checked
+    # before anything touches the network.
+    if ! [[ "${CI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo 'ci: CI_RUN_ID is not a lowercase UUID' >&2
+        exit 2
+    fi
+
+    if [ -z "${CI_JOB_NAME:-}" ]; then
+        echo 'ci: CI_JOB_NAME is empty' >&2
+        exit 2
+    fi
+
+    # The server and both audiences are the pool's own; there is no default
+    # to fall back on, so a missing one stops the job before the network.
+    local required
+    for required in CI_API CI_TOKEN_AUDIENCE CI_RESULTS_AUDIENCE; do
+        if [ -z "${!required:-}" ]; then
+            echo "ci: $required is not set" >&2
+            exit 2
+        fi
+    done
+
+    umask 077
+    install -d -m 0711 "$root"
+    install -d -m 0700 "$state" "$secret"
+
+    # fd 3 is the public log; stdout and stderr of everything else go private.
+    # ci-sandbox closes fd 3 before it drops privileges.
+    exec 3>&1
+    exec >>"$state/$phase.log" 2>&1
+
+    trap 'on_error "$LINENO"' ERR
+
+    "$phase"
+}
+
+# Sourced by scripts/test/ci-job.test.sh for its pure helpers; run otherwise.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

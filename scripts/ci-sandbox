@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Runs one command as the unprivileged CI account, then kills every process
+# that account still owns. Everything a pull request ships (dependency
+# installs, tests, linters, repository scripts) goes through here.
+#
+# usage: ci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+#        ci-sandbox --reap
+#
+# The child runs with:
+#   - uid and gid 2000, no supplementary groups, no capabilities (inheritable,
+#     ambient and bounding sets emptied), no_new_privs so no setuid binary can
+#     give any back (setpriv);
+#   - an environment of PATH (child_path below), LANG, CI, a fresh HOME and
+#     the given NAME=VALUE pairs only (env -i), so the runner's ACTIONS_*
+#     tokens and the GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH and
+#     GITHUB_STEP_SUMMARY paths are absent;
+#   - stdin from /dev/null, stdout and stderr appended to <log-file> (created
+#     0600 by root) and no other file descriptor, so a workflow command it
+#     prints never reaches the runner, which parses only the step's own stdout
+#     and stderr;
+#   - at most 4096 processes, so the kill loop below always catches up.
+# Before the child starts, the runner's temp directory (it holds the file
+# command files and the step scripts), /github/home and /github/workflow are
+# made 0700. They belong to the runner's host account, which keeps its
+# access; root in the container bypasses the mode.
+#
+# After the child exits, every live uid 2000 process is SIGKILLed until none
+# is left. Zombies are not counted: a zombie runs no code, and a container
+# started without --init has `tail -f /dev/null` as PID 1, which never reaps.
+# --keep skips that kill; only the isolation probe uses it, to prove the
+# survivor check fails when a process is left behind.
+#
+# --postgres starts a throwaway PostgreSQL server inside the same sandbox
+# before the command: initdb and pg_ctl run as uid 2000 under the same env -i,
+# the data directory lives in the fresh HOME, and the server listens on the
+# Unix socket in /run/ci-postgres only (superuser postgres, trust auth,
+# database postgres, port 5432; PGHOST, PGPORT, PGUSER and PGDATABASE say so).
+# The server, and anything it starts (COPY TO PROGRAM), is uid 2000, so the
+# kill loop takes it down with the command.
+#
+# Exits with the child's status, or 125 when uid 2000 processes survive the
+# kill loop. --reap runs the kill loop alone (0, or 125 on survivors).
+set -euo pipefail
+
+# Root resolves pkill, setpriv and the rest from root-owned directories only.
+# The child's PATH adds the image's SDK directories (Go and PostgreSQL in the
+# php image, Flutter in the flutter one), so a file uid 2000 manages to plant
+# in one of them only ever runs as uid 2000.
+root_path=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="$root_path"
+
+child_path=''
+for tool_dir in /usr/local/go/bin /usr/lib/postgresql/*/bin /opt/flutter/bin; do
+    if [ -d "$tool_dir" ]; then
+        child_path+="$tool_dir:"
+    fi
+done
+child_path+="$root_path"
+
+sandbox_uid=2000
+nproc_limit=4096
+postgres_socket_dir=/run/ci-postgres
+
+# Runs as uid 2000 in front of the command. /run is root-only, so the socket
+# directory root prepares there cannot have been swapped for a symlink.
+postgres_wrapper="$(
+    cat <<'SH'
+set -e
+initdb --pgdata="$HOME/pgdata" --username=postgres --auth=trust --encoding=UTF8 --no-sync --no-instructions
+if ! pg_ctl --pgdata="$HOME/pgdata" --log="$HOME/postgres.log" --wait \
+    --options="-c listen_addresses='' -c unix_socket_directories='$PGHOST' -c fsync=off" start; then
+    cat "$HOME/postgres.log"
+    exit 1
+fi
+exec "$@"
+SH
+)"
+
+usage() {
+    echo 'usage: ci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
+    echo '       ci-sandbox --reap' >&2
+    exit 2
+}
+
+live_sandbox_processes() {
+    ps -A -o uid=,stat= | awk -v uid="$sandbox_uid" '$1 == uid && $2 !~ /^Z/ { n++ } END { print n + 0 }'
+}
+
+# SIGKILL is not instant and a forking process can add children between two
+# scans, so the loop repeats until a scan comes back empty, for up to 10 s.
+reap() {
+    local attempt
+    local status
+
+    for attempt in $(seq 1 100); do
+        status=0
+        pkill -9 -u "$sandbox_uid" || status=$?
+
+        # pkill: 0 signalled something, 1 matched nothing, 2 or 3 is a failure.
+        if [ "$status" -gt 1 ]; then
+            echo "ci-sandbox: pkill failed with status $status" >&2
+            return 125
+        fi
+
+        if [ "$(live_sandbox_processes)" -eq 0 ]; then
+            return 0
+        fi
+
+        if [ "$attempt" -lt 100 ]; then
+            sleep 0.1
+        fi
+    done
+
+    echo 'ci-sandbox: uid 2000 processes survived the kill loop' >&2
+    return 125
+}
+
+lock_runner_dirs() {
+    local dir
+    local dirs=(
+        "${RUNNER_TEMP:-}"
+        /github/home
+        /github/workflow
+    )
+
+    for dir in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STEP_SUMMARY:-}"; do
+        if [ -n "$dir" ]; then
+            dirs+=("$(dirname "$dir")")
+        fi
+    done
+
+    for dir in "${dirs[@]}"; do
+        if [ -n "$dir" ] && [ -d "$dir" ]; then
+            chmod 0700 "$dir"
+        fi
+    done
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo 'ci-sandbox: must run as root' >&2
+    exit 2
+fi
+
+if [ "${1:-}" = --reap ]; then
+    [ $# -eq 1 ] || usage
+    reap
+    exit $?
+fi
+
+keep=false
+postgres=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep) keep=true ;;
+        --postgres) postgres=true ;;
+        *) break ;;
+    esac
+    shift
+done
+
+[ $# -ge 4 ] || usage
+
+log="$1"
+workdir="$2"
+shift 2
+
+child_env=(
+    "PATH=$child_path"
+    LANG=C.UTF-8
+    CI=true
+)
+
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    if ! [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        usage
+    fi
+    child_env+=("$1")
+    shift
+done
+
+[ "${1:-}" = -- ] || usage
+shift
+[ $# -ge 1 ] || usage
+
+lock_runner_dirs
+
+# 1. A fresh HOME per command: nothing one phase leaves in it (an .npmrc, a
+#    shell rc file, a planted binary) reaches the next.
+home="$(mktemp -d /tmp/ci-home.XXXXXXXX)"
+chown "$sandbox_uid:$sandbox_uid" "$home"
+chmod 0700 "$home"
+child_env+=("HOME=$home")
+
+# 2. The database, when asked for, comes up inside the child itself, so it
+#    shares the child's environment, limits and fate.
+if [ "$postgres" = true ]; then
+    rm -rf "$postgres_socket_dir"
+    install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$postgres_socket_dir"
+    child_env+=(
+        "PGHOST=$postgres_socket_dir"
+        PGPORT=5432
+        PGUSER=postgres
+        PGDATABASE=postgres
+    )
+    set -- bash -c "$postgres_wrapper" ci-postgres "$@"
+fi
+
+# 3. Run the child. The subshell stays root until setpriv, so it can open the
+#    root-owned log and close every inherited descriptor above 2 first.
+status=0
+(
+    umask 077
+    exec </dev/null >>"$log" 2>&1
+
+    for fd_path in /proc/self/fd/*; do
+        fd="${fd_path##*/}"
+        if [ "$fd" -gt 2 ] && [ -e "$fd_path" ]; then
+            exec {fd}>&-
+        fi
+    done
+
+    ulimit -u "$nproc_limit"
+    cd "$workdir"
+
+    exec setpriv \
+        --reuid="$sandbox_uid" \
+        --regid="$sandbox_uid" \
+        --clear-groups \
+        --no-new-privs \
+        --inh-caps=-all \
+        --bounding-set=-all \
+        -- env -i "${child_env[@]}" "$@"
+) || status=$?
+
+# 4. Nothing the child started may outlive it: the caller uses secrets next.
+if [ "$keep" = false ]; then
+    reap || exit $?
+    rm -rf "$home"
+    if [ "$postgres" = true ]; then
+        rm -rf "$postgres_socket_dir"
+    fi
+fi
+
+exit "$status"
